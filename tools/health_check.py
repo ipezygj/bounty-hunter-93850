@@ -65,12 +65,29 @@ MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
 
 # ---------------------------------------------------------------------------
+# RETRY LOGIC
+# ---------------------------------------------------------------------------
+
+def _retry_with_backoff(operation, max_retries=HEALTH_CHECK_MAX_RETRIES, base_delay=HEALTH_CHECK_BASE_DELAY):
+    """Retry operation with exponential backoff on transient failures."""
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
 def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
     import http.client
-    try:
+
+    def _check():
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.request("GET", path)
         resp = conn.getresponse()
@@ -89,27 +106,35 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
             detail = f"HTTP {status}: {body[:100]}"
 
         return result, detail, status
+
+    try:
+        return _retry_with_backoff(_check)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return "CRITICAL", str(e), 0
     except Exception as e:
         return "CRITICAL", str(e), 0
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
-    try:
+    def _check():
         start = time.time()
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.close()
         latency = (time.time() - start) * 1000
         return "OK", f"Connected ({latency:.1f}ms)", latency
+
+    try:
+        return _retry_with_backoff(_check)
     except socket.timeout:
         return "CRITICAL", f"Connection timeout ({timeout}s)", 0
-    except ConnectionRefusedError:
-        return "CRITICAL", "Connection refused", 0
+    except (ConnectionRefusedError, OSError) as e:
+        return "CRITICAL", str(e), 0
     except Exception as e:
         return "CRITICAL", str(e), 0
 
 
 def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]:
-    try:
+    def _check():
         ctx = ssl.create_default_context()
         with socket.create_connection((host, port), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
@@ -127,6 +152,11 @@ def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]
                     return "WARNING", f"Certificate expires in {days_left} days", days_left
                 else:
                     return "CRITICAL", f"Certificate expires in {days_left} days", days_left
+
+    try:
+        return _retry_with_backoff(_check)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return "WARNING", f"Cannot check: {e}", 0
     except Exception as e:
         return "WARNING", f"Cannot check: {e}", 0
 
