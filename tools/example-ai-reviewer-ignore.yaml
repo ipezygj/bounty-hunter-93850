@@ -1,0 +1,33 @@
+# AI Reviewer Ignore Configuration
+# ================================
+# Configure which code review findings to ignore.
+#
+# Rules: Specific rule IDs to ignore
+# Categories: Review categories to ignore (style, security, performance, etc.)
+# Severities: Severity levels to ignore (critical, error, warning, info, suggestion)
+# Files: File glob patterns to ignore entirely
+# Messages: Message substring patterns to ignore
+
+rules:
+  - STYLE-LINE-LENGTH
+  - PERF-NPLUS1
+  - SEC-HARDCODED-KEY
+
+categories:
+  - documentation
+  - testing
+
+severities:
+  - suggestion
+  - info
+
+files:
+  - "*.generated.py"
+  - "migrations/*.py"
+  - "tests/**/*.py"
+  - "**/vendor/**"
+
+messages:
+  - "debug output"
+  - "test pattern"
+  - "experimental"

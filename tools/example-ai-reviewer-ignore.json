@@ -1,0 +1,26 @@
+{
+  "rules": [
+    "STYLE-LINE-LENGTH",
+    "PERF-NPLUS1",
+    "SEC-HARDCODED-KEY"
+  ],
+  "categories": [
+    "documentation",
+    "testing"
+  ],
+  "severities": [
+    "suggestion",
+    "info"
+  ],
+  "files": [
+    "*.generated.py",
+    "migrations/*.py",
+    "tests/**/*.py",
+    "**/vendor/**"
+  ],
+  "messages": [
+    "debug output",
+    "test pattern",
+    "experimental"
+  ]
+}

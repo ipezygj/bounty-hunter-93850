@@ -39,6 +39,12 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -103,6 +109,16 @@ DEFAULT_MAX_LINE_LENGTH = 100
 DEFAULT_MAX_FILE_LENGTH = 500
 DEFAULT_MAX_PARAMS = 5
 
+# Default ignore config file names
+DEFAULT_IGNORE_CONFIG_FILES = [
+    ".ai-reviewer-ignore",
+    ".ai-reviewer-ignore.json",
+    ".ai-reviewer-ignore.yaml",
+    ".ai-reviewer-ignore.yml",
+    "ai-reviewer-ignore.json",
+    "ai-reviewer-ignore.yaml",
+]
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -131,6 +147,49 @@ class ReviewCategory(Enum):
     TESTING = "testing"
     DEPENDENCY = "dependency"
     DUPLICATION = "duplication"
+
+
+@dataclass
+class IgnoreConfig:
+    """Configuration for rules to ignore during code review."""
+
+    ignored_rules: Set[str] = field(default_factory=set)
+    ignored_categories: Set[ReviewCategory] = field(default_factory=set)
+    ignored_severities: Set[ReviewSeverity] = field(default_factory=set)
+    ignored_files: Set[str] = field(default_factory=set)  # glob patterns
+    ignored_messages: Set[str] = field(default_factory=set)  # substring matches
+
+    def should_ignore_finding(self, finding: "ReviewFinding") -> bool:
+        """Check if a finding should be ignored based on config."""
+        # Check if rule is explicitly ignored
+        if finding.rules:
+            for rule in finding.rules:
+                if rule in self.ignored_rules:
+                    return True
+
+        # Check if category is ignored
+        if finding.category in self.ignored_categories:
+            return True
+
+        # Check if severity is ignored
+        if finding.severity in self.ignored_severities:
+            return True
+
+        # Check if message contains ignored substring
+        for ignored_msg in self.ignored_messages:
+            if ignored_msg.lower() in finding.message.lower():
+                return True
+
+        return False
+
+    def should_ignore_file(self, file_path: str) -> bool:
+        """Check if a file should be ignored based on glob patterns."""
+        from fnmatch import fnmatch
+
+        for pattern in self.ignored_files:
+            if fnmatch(file_path, pattern) or fnmatch(Path(file_path).name, pattern):
+                return True
+        return False
 
 
 @dataclass
@@ -207,6 +266,108 @@ class ProjectReviewReport:
     suggestions: int
     file_results: List[FileReviewResult] = field(default_factory=list)
     summary: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Ignore Configuration Loader
+# ---------------------------------------------------------------------------
+
+
+class IgnoreConfigLoader:
+    """Loads and parses ignore configuration from various formats."""
+
+    @staticmethod
+    def load_config(config_path: Optional[Path] = None, project_root: Optional[Path] = None) -> IgnoreConfig:
+        """Load ignore configuration from file.
+
+        Args:
+            config_path: Explicit path to config file
+            project_root: Project root to search for default config files
+
+        Returns:
+            IgnoreConfig object (empty if no config found)
+        """
+        config = IgnoreConfig()
+
+        if config_path:
+            if config_path.exists():
+                config = IgnoreConfigLoader._parse_config_file(config_path)
+                logging.getLogger("IgnoreConfigLoader").info(f"Loaded config from {config_path}")
+        else:
+            # Search for default config files
+            search_root = project_root or Path.cwd()
+            for config_name in DEFAULT_IGNORE_CONFIG_FILES:
+                candidate = search_root / config_name
+                if candidate.exists():
+                    config = IgnoreConfigLoader._parse_config_file(candidate)
+                    logging.getLogger("IgnoreConfigLoader").info(f"Found config at {candidate}")
+                    break
+
+        return config
+
+    @staticmethod
+    def _parse_config_file(config_path: Path) -> IgnoreConfig:
+        """Parse a configuration file in JSON or YAML format."""
+        config = IgnoreConfig()
+        content = config_path.read_text(encoding="utf-8")
+
+        try:
+            if config_path.suffix in (".yaml", ".yml"):
+                if not HAS_YAML:
+                    logging.getLogger("IgnoreConfigLoader").warning("PyYAML not installed, skipping YAML config")
+                    return config
+                data = yaml.safe_load(content)
+            else:
+                # Assume JSON format
+                data = json.loads(content)
+
+            if isinstance(data, dict):
+                # Parse ignored_rules
+                if "rules" in data:
+                    rules = data["rules"]
+                    if isinstance(rules, list):
+                        config.ignored_rules = set(rules)
+                    elif isinstance(rules, str):
+                        config.ignored_rules = {rules}
+
+                # Parse ignored_categories
+                if "categories" in data:
+                    categories = data["categories"]
+                    if isinstance(categories, list):
+                        config.ignored_categories = {
+                            ReviewCategory(cat) for cat in categories if cat in ReviewCategory._value2member_map_
+                        }
+
+                # Parse ignored_severities
+                if "severities" in data:
+                    severities = data["severities"]
+                    if isinstance(severities, list):
+                        config.ignored_severities = {
+                            ReviewSeverity(sev) for sev in severities if sev in ReviewSeverity._value2member_map_
+                        }
+
+                # Parse ignored_files
+                if "files" in data:
+                    files = data["files"]
+                    if isinstance(files, list):
+                        config.ignored_files = set(files)
+                    elif isinstance(files, str):
+                        config.ignored_files = {files}
+
+                # Parse ignored_messages (substring patterns)
+                if "messages" in data:
+                    messages = data["messages"]
+                    if isinstance(messages, list):
+                        config.ignored_messages = set(messages)
+                    elif isinstance(messages, str):
+                        config.ignored_messages = {messages}
+
+        except (json.JSONDecodeError, yaml.YAMLError) as e:
+            logging.getLogger("IgnoreConfigLoader").error(f"Failed to parse config file {config_path}: {e}")
+        except Exception as e:
+            logging.getLogger("IgnoreConfigLoader").error(f"Error loading config: {e}")
+
+        return config
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +559,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-PATH-TRAVERSAL",
                 "name": "Path Traversal",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(open|read|write|unlink|rmdir|Path::new)\s*\(\s*['\"](\.\./|/etc/|/var/)",
                 "message": "Possible path traversal vulnerability. Validate file paths.",
                 "effort": 20,
@@ -406,7 +567,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-INSECURE-RANDOM",
                 "name": "Insecure Random Number Generator",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(random\.randint|random\.choice|srand|rand\(\)|math\.random)",
                 "message": "Use cryptographically secure random generation for security-sensitive contexts.",
                 "effort": 10,
@@ -414,7 +575,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-INSECURE-COOKIE",
                 "name": "Insecure Cookie Configuration",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"cookie\s*[\[=]\s*.*\b(httpOnly|secure|sameSite)\b\s*[=:]\s*(false|False|None)",
                 "message": "Insecure cookie configuration. Set HttpOnly, Secure, and SameSite attributes.",
                 "effort": 10,
@@ -422,7 +583,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-XXE",
                 "name": "XML External Entity (XXE)",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(xml\.etree|xml_parser|parse\(|SAXParser|DocumentBuilder)",
                 "message": "Possible XXE vulnerability. Disable external entity parsing.",
                 "effort": 20,
@@ -542,13 +703,28 @@ class AiCodeReviewer:
 
     Analyzes code for quality, style, security, and performance issues.
     Generates detailed review reports with severity levels and actionable suggestions.
+    Supports ignore configuration to skip specific rules, categories, or severities.
     """
 
-    def __init__(self):
+    def __init__(self, ignore_config: Optional[IgnoreConfig] = None, config_path: Optional[Path] = None):
         self.quality_analyzer = CodeQualityAnalyzer()
         self.security_auditor = SecurityAuditor()
         self.performance_profiler = PerformanceProfiler()
         self.logger = logging.getLogger("AiCodeReviewer")
+
+        # Load ignore configuration
+        if ignore_config:
+            self.ignore_config = ignore_config
+        elif config_path:
+            self.ignore_config = IgnoreConfigLoader.load_config(config_path=config_path)
+        else:
+            self.ignore_config = IgnoreConfigLoader.load_config()
+
+        if self.ignore_config.ignored_rules or self.ignore_config.ignored_categories:
+            self.logger.info(
+                f"Ignore config loaded: {len(self.ignore_config.ignored_rules)} rules, "
+                f"{len(self.ignore_config.ignored_categories)} categories"
+            )
 
         if HAS_MIGRATOR:
             self.pattern_detector = PatternDetector()
@@ -560,6 +736,16 @@ class AiCodeReviewer:
         """Review a single file and return the result."""
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
+
+        # Check if file should be ignored
+        if self.ignore_config.should_ignore_file(str(path)):
+            self.logger.info(f"Skipping file due to ignore config: {path}")
+            return FileReviewResult(
+                file_path=str(path),
+                language=path.suffix.lstrip("."),
+                line_count=0,
+                summary=f"Skipped due to ignore configuration: {path}",
+            )
 
         source = path.read_text(encoding="utf-8", errors="replace")
         language = path.suffix.lstrip(".")
@@ -578,74 +764,76 @@ class AiCodeReviewer:
 
         # Security audit
         security_findings = self.security_auditor.audit(source, str(path))
+        security_findings = [f for f in security_findings if not self.ignore_config.should_ignore_finding(f)]
         result.findings.extend(security_findings)
 
         # Performance profiling
         perf_findings = self.performance_profiler.profile(source, str(path))
+        perf_findings = [f for f in perf_findings if not self.ignore_config.should_ignore_finding(f)]
         result.findings.extend(perf_findings)
 
         # Style issues
         for i, line in enumerate(lines, 1):
             if len(line.rstrip()) > DEFAULT_MAX_LINE_LENGTH:
-                result.findings.append(
-                    ReviewFinding(
-                        id=f"STYLE-LINELEN-{i}-{int(time.time())}",
-                        severity=ReviewSeverity.INFO,
-                        category=ReviewCategory.STYLE,
-                        message=f"Line exceeds {DEFAULT_MAX_LINE_LENGTH} characters ({len(line.rstrip())})",
-                        file_path=str(path),
-                        line_number=i,
-                        suggestion="Break long lines to improve readability.",
-                        effort_minutes=2,
-                        rules=["STYLE-LINE-LENGTH"],
-                    )
+                finding = ReviewFinding(
+                    id=f"STYLE-LINELEN-{i}-{int(time.time())}",
+                    severity=ReviewSeverity.INFO,
+                    category=ReviewCategory.STYLE,
+                    message=f"Line exceeds {DEFAULT_MAX_LINE_LENGTH} characters ({len(line.rstrip())})",
+                    file_path=str(path),
+                    line_number=i,
+                    suggestion="Break long lines to improve readability.",
+                    effort_minutes=2,
+                    rules=["STYLE-LINE-LENGTH"],
                 )
+                if not self.ignore_config.should_ignore_finding(finding):
+                    result.findings.append(finding)
 
         # Complexity warnings
         if complexity.cyclomatic_complexity > DEFAULT_MAX_COMPLEXITY:
-            result.findings.append(
-                ReviewFinding(
-                    id=f"CMPLX-CYCLO-{int(time.time())}",
-                    severity=ReviewSeverity.WARNING,
-                    category=ReviewCategory.COMPLEXITY,
-                    message=f"High cyclomatic complexity ({complexity.cyclomatic_complexity})",
-                    file_path=str(path),
-                    line_number=1,
-                    suggestion="Refactor into smaller functions to reduce complexity.",
-                    effort_minutes=30,
-                    rules=["CMPLX-CYCLOMATIC"],
-                )
+            finding = ReviewFinding(
+                id=f"CMPLX-CYCLO-{int(time.time())}",
+                severity=ReviewSeverity.WARNING,
+                category=ReviewCategory.COMPLEXITY,
+                message=f"High cyclomatic complexity ({complexity.cyclomatic_complexity})",
+                file_path=str(path),
+                line_number=1,
+                suggestion="Refactor into smaller functions to reduce complexity.",
+                effort_minutes=30,
+                rules=["CMPLX-CYCLOMATIC"],
             )
+            if not self.ignore_config.should_ignore_finding(finding):
+                result.findings.append(finding)
 
         if complexity.cognitive_complexity > 30:
-            result.findings.append(
-                ReviewFinding(
-                    id=f"CMPLX-COGNITIVE-{int(time.time())}",
-                    severity=ReviewSeverity.WARNING,
-                    category=ReviewCategory.COMPLEXITY,
-                    message=f"High cognitive complexity ({complexity.cognitive_complexity})",
-                    file_path=str(path),
-                    line_number=1,
-                    suggestion="Consider extracting nested logic into helper functions.",
-                    effort_minutes=20,
-                    rules=["CMPLX-COGNITIVE"],
-                )
+            finding = ReviewFinding(
+                id=f"CMPLX-COGNITIVE-{int(time.time())}",
+                severity=ReviewSeverity.WARNING,
+                category=ReviewCategory.COMPLEXITY,
+                message=f"High cognitive complexity ({complexity.cognitive_complexity})",
+                file_path=str(path),
+                line_number=1,
+                suggestion="Consider extracting nested logic into helper functions.",
+                effort_minutes=20,
+                rules=["CMPLX-COGNITIVE"],
             )
+            if not self.ignore_config.should_ignore_finding(finding):
+                result.findings.append(finding)
 
         if complexity.max_parameters > DEFAULT_MAX_PARAMS:
-            result.findings.append(
-                ReviewFinding(
-                    id=f"CMPLX-PARAMS-{int(time.time())}",
-                    severity=ReviewSeverity.WARNING,
-                    category=ReviewCategory.COMPLEXITY,
-                    message=f"Function with {complexity.max_parameters} parameters exceeds limit of {DEFAULT_MAX_PARAMS}",
-                    file_path=str(path),
-                    line_number=1,
-                    suggestion="Consider using a configuration object or reducing parameters.",
-                    effort_minutes=15,
-                    rules=["CMPLX-PARAMETER-COUNT"],
-                )
+            finding = ReviewFinding(
+                id=f"CMPLX-PARAMS-{int(time.time())}",
+                severity=ReviewSeverity.WARNING,
+                category=ReviewCategory.COMPLEXITY,
+                message=f"Function with {complexity.max_parameters} parameters exceeds limit of {DEFAULT_MAX_PARAMS}",
+                file_path=str(path),
+                line_number=1,
+                suggestion="Consider using a configuration object or reducing parameters.",
+                effort_minutes=15,
+                rules=["CMPLX-PARAMETER-COUNT"],
             )
+            if not self.ignore_config.should_ignore_finding(finding):
+                result.findings.append(finding)
 
         # Use pattern detector from migrator if available
         if self.pattern_detector:
@@ -658,20 +846,20 @@ class AiCodeReviewer:
                         PatternSeverity.MEDIUM: ReviewSeverity.WARNING,
                         PatternSeverity.LOW: ReviewSeverity.INFO,
                     }
-                    result.findings.append(
-                        ReviewFinding(
-                            id=f"PATTERN-{pat.name}-{pat.line_number}-{int(time.time())}",
-                            severity=severity_map.get(pat.severity, ReviewSeverity.INFO),
-                            category=ReviewCategory.BEST_PRACTICE,
-                            message=f"{pat.name}: {pat.description}",
-                            file_path=str(path),
-                            line_number=pat.line_number,
-                            suggestion=pat.replacement_pattern,
-                            code_snippet=pat.snippet,
-                            effort_minutes=10,
-                            rules=[f"PATTERN-{pat.name.upper().replace(' ', '-')}"],
-                        )
+                    finding = ReviewFinding(
+                        id=f"PATTERN-{pat.name}-{pat.line_number}-{int(time.time())}",
+                        severity=severity_map.get(pat.severity, ReviewSeverity.INFO),
+                        category=ReviewCategory.BEST_PRACTICE,
+                        message=f"{pat.name}: {pat.description}",
+                        file_path=str(path),
+                        line_number=pat.line_number,
+                        suggestion=pat.replacement_pattern,
+                        code_snippet=pat.snippet,
+                        effort_minutes=10,
+                        rules=[f"PATTERN-{pat.name.upper().replace(' ', '-')}"],
                     )
+                    if not self.ignore_config.should_ignore_finding(finding):
+                        result.findings.append(finding)
             except Exception as e:
                 self.logger.warning(f"Pattern detection failed: {e}")
 
@@ -795,6 +983,36 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path", type=str, required=True, help="File or directory to review")
     parser.add_argument("--recursive", action="store_true", help="Review directories recursively")
     parser.add_argument("--output", type=str, default=None, help="Output JSON report path")
+    parser.add_argument(
+        "--ignore-config",
+        type=str,
+        default=None,
+        help="Path to ignore configuration file (JSON or YAML)",
+    )
+    parser.add_argument(
+        "--ignore-rule",
+        type=str,
+        action="append",
+        dest="ignore_rules",
+        default=None,
+        help="Rule IDs to ignore (can be repeated)",
+    )
+    parser.add_argument(
+        "--ignore-category",
+        type=str,
+        action="append",
+        dest="ignore_categories",
+        default=None,
+        help="Categories to ignore (can be repeated)",
+    )
+    parser.add_argument(
+        "--ignore-severity",
+        type=str,
+        action="append",
+        dest="ignore_severities",
+        default=None,
+        help="Severities to ignore (can be repeated)",
+    )
     return parser
 
 
@@ -802,7 +1020,28 @@ def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
 
-    reviewer = AiCodeReviewer()
+    # Build ignore config
+    ignore_config = None
+    if args.ignore_config:
+        ignore_config = IgnoreConfigLoader.load_config(config_path=Path(args.ignore_config))
+    elif args.ignore_rules or args.ignore_categories or args.ignore_severities:
+        ignore_config = IgnoreConfig()
+        if args.ignore_rules:
+            ignore_config.ignored_rules = set(args.ignore_rules)
+        if args.ignore_categories:
+            ignore_config.ignored_categories = {
+                ReviewCategory(cat)
+                for cat in args.ignore_categories
+                if cat in ReviewCategory._value2member_map_
+            }
+        if args.ignore_severities:
+            ignore_config.ignored_severities = {
+                ReviewSeverity(sev)
+                for sev in args.ignore_severities
+                if sev in ReviewSeverity._value2member_map_
+            }
+
+    reviewer = AiCodeReviewer(ignore_config=ignore_config)
     path = Path(args.path)
 
     if path.is_file():
@@ -824,15 +1063,15 @@ def main() -> int:
         print(f"\nFindings ({len(result.findings)} total):")
         for f in result.findings:
             severity_icon = {
-                ReviewSeverity.CRITICAL: "🔴",
-                ReviewSeverity.ERROR: "🟠",
-                ReviewSeverity.WARNING: "🟡",
-                ReviewSeverity.INFO: "🔵",
-                ReviewSeverity.SUGGESTION: "💡",
-            }.get(f.severity, "⚪")
-            print(f"  {severity_icon} [{f.severity.value.upper()}] L{f.line_number}: {f.message}")
+                ReviewSeverity.CRITICAL: "[CRITICAL]",
+                ReviewSeverity.ERROR: "[ERROR]",
+                ReviewSeverity.WARNING: "[WARNING]",
+                ReviewSeverity.INFO: "[INFO]",
+                ReviewSeverity.SUGGESTION: "[SUGGESTION]",
+            }.get(f.severity, "[UNKNOWN]")
+            print(f"  {severity_icon} L{f.line_number}: {f.message}")
             if f.suggestion:
-                print(f"     💡 {f.suggestion}")
+                print(f"     Suggestion: {f.suggestion}")
         print()
 
     elif path.is_dir():
@@ -842,11 +1081,11 @@ def main() -> int:
         print(f"{'='*60}")
         print(report.summary)
         print(f"\nFindings by Severity:")
-        print(f"  🔴 Critical: {report.critical_findings}")
-        print(f"  🟠 Errors: {report.errors}")
-        print(f"  🟡 Warnings: {report.warnings}")
-        print(f"  🔵 Info: {report.info_findings}")
-        print(f"  💡 Suggestions: {report.suggestions}")
+        print(f"  Critical: {report.critical_findings}")
+        print(f"  Errors: {report.errors}")
+        print(f"  Warnings: {report.warnings}")
+        print(f"  Info: {report.info_findings}")
+        print(f"  Suggestions: {report.suggestions}")
         print()
 
         if args.output:
