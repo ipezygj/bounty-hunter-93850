@@ -107,6 +107,7 @@ export function useWebSocket(options: WSOptions) {
   const mountedRef = useRef(true);
   const messageIdRef = useRef(0);
   const pingStartRef = useRef(0);
+  const connectRef = useRef<() => void>(() => {});
 
   const [state, setState] = useState<WSState>({
     connectionState: 'disconnected',
@@ -175,6 +176,12 @@ export function useWebSocket(options: WSOptions) {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) {
       return;
+    }
+
+    // Clear any pending reconnect timers before creating new WebSocket
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
     }
 
     updateState({ connectionState: 'connecting', reconnectAttempt: reconnectAttemptRef.current });
@@ -276,6 +283,11 @@ export function useWebSocket(options: WSOptions) {
     }
   }, [mergedOptions, sendMessage, updateState, state.totalMessagesReceived]);
 
+  // Store connect in ref to avoid circular dependency with scheduleReconnect
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
+
   const disconnect = useCallback(() => {
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
@@ -309,9 +321,9 @@ export function useWebSocket(options: WSOptions) {
     updateState({ connectionState: 'reconnecting', reconnectAttempt: reconnectAttemptRef.current });
 
     reconnectTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) connect();
+      if (mountedRef.current) connectRef.current();
     }, delay);
-  }, [mergedOptions, connect, updateState]);
+  }, [mergedOptions, updateState]);
 
   const startPing = useCallback(() => {
     stopPing();
@@ -368,7 +380,8 @@ export function useWebSocket(options: WSOptions) {
       mountedRef.current = false;
       disconnect();
     };
-  }, []);
+    // Fixed: no reconnect after unmount (was issue #438)
+  }, [mergedOptions, connect, disconnect]);
 
   return {
     ...state,
